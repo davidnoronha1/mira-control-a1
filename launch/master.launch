@@ -1,0 +1,10 @@
+<launch>
+    <!-- Same arguments and node name as mira2_control_master/alt_master.launch -->
+    <arg name="pixhawk_address" default="/dev/Pixhawk"/>
+    <arg name="initial_mode" default="STABILIZE"/>
+
+    <node name="pymavlink_commands" pkg="mira2_control_master_go" exec="master" output="screen">
+        <param name="pixhawk_address" value="$(var pixhawk_address)"/>
+        <param name="initial_mode" value="$(var initial_mode)"/>
+    </node>
+</launch>

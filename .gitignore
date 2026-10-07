@@ -1,3 +1,6 @@
 m
 m.exe
 **/.venv
+/msgs/
+/master
+/build/
