@@ -1,2 +1,4 @@
 [X] Create event reciever channel
 [X] Create wait_for_heartbeat
+[X] Resolve issue where commands are not accepted by the PixHawk (see README)
+[X] Port to ROS 2 (rclgo)
