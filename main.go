@@ -51,15 +51,32 @@ type Config struct {
 }
 
 // Work for the PixHawk command goroutine, every COMMAND_LONG goes through it
-// so there is only ever one command waiting on an ack
+// so there is only ever one command waiting on an ack.
+//
+// ARM / DISARM / emergency disarm go on priority_ch and are always handled
+// before anything on command_ch. ARM is on the priority queue as well so that a
+// DISARM can never overtake an earlier ARM (which would leave the vehicle armed).
 type CommandKind int
 
 const (
 	CMD_ARM CommandKind = iota
 	CMD_DISARM
+	CMD_EMERGENCY_DISARM
 	CMD_SET_MODE
 	CMD_MESSAGE_INTERVAL
 )
+
+func (kind CommandKind) isPriority() bool {
+	return kind == CMD_ARM || kind == CMD_DISARM || kind == CMD_EMERGENCY_DISARM
+}
+
+// Returned by sendCommandLong when a priority command arrived while a normal
+// command was waiting for its ack
+var errPreempted = errors.New("preempted by a priority command")
+
+// MAV_CMD_COMPONENT_ARM_DISARM param2 value that makes ArduPilot disarm even
+// if it would normally refuse, only used for the emergency kill
+const FORCE_DISARM_MAGIC = 21196
 
 type PixhawkCommand struct {
 	kind    CommandKind
@@ -77,7 +94,9 @@ type Master struct {
 	// Publishers & Subscribers
 	command_sub   *custom_msgs.CommandsSubscription
 	thruster_sub  *custom_msgs.CommandsSubscription
-	emergency_srv *std_srvs.TriggerService
+	toggle_srv    *std_srvs.TriggerService
+	kill_srv      *std_srvs.TriggerService
+	clear_srv     *std_srvs.TriggerService
 	telemetry_pub *custom_msgs.TelemetryPublisher
 	depth_pub     *custom_msgs.DepthPublisher
 	heading_pub   *custom_msgs.HeadingPublisher
@@ -87,6 +106,10 @@ type Master struct {
 	ack_ch       chan common.MessageCommandAck
 	telemetry_ch chan message.Message
 	command_ch   chan PixhawkCommand
+	priority_ch  chan PixhawkCommand
+	// Signalled (non blocking) whenever something is put on priority_ch, so a
+	// normal command waiting on its ack can give way immediately
+	priority_signal chan struct{}
 	// State, shared between goroutines so guarded by mu
 	mu               sync.Mutex
 	target_system    uint8
@@ -116,6 +139,9 @@ func NewApplication(config Config, _pixhawk *gomavlib.Node, _ros *rclgo.Node) *M
 		ack_ch:       make(chan common.MessageCommandAck, 8),
 		telemetry_ch: make(chan message.Message, 64),
 		command_ch:   make(chan PixhawkCommand, 32),
+		priority_ch:  make(chan PixhawkCommand, 16),
+
+		priority_signal: make(chan struct{}, 1),
 
 		channel_arr: [8]int{NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM},
 		mode:        config.initial_mode,
@@ -139,9 +165,20 @@ func NewApplication(config Config, _pixhawk *gomavlib.Node, _ros *rclgo.Node) *M
 		log.Fatal("[ROS] Failed to register /rov/commands subscriber", "err", err)
 	}
 
-	app.emergency_srv, err = std_srvs.NewTriggerService(n, "/toggle_emergency", nil, app.onToggleEmergency)
+	// Used by mira2_control_master's killswitch node
+	app.toggle_srv, err = std_srvs.NewTriggerService(n, "/toggle_emergency", nil, app.onToggleEmergency)
 	if err != nil {
 		log.Fatal("[ROS] Failed to register /toggle_emergency service", "err", err)
+	}
+
+	app.kill_srv, err = std_srvs.NewTriggerService(n, "/emergency_kill", nil, app.onEmergencyKill)
+	if err != nil {
+		log.Fatal("[ROS] Failed to register /emergency_kill service", "err", err)
+	}
+
+	app.clear_srv, err = std_srvs.NewTriggerService(n, "/clear_emergency", nil, app.onClearEmergency)
+	if err != nil {
+		log.Fatal("[ROS] Failed to register /clear_emergency service", "err", err)
 	}
 
 	app.telemetry_pub, err = custom_msgs.NewTelemetryPublisher(n, "/master/telemetry", nil)
@@ -192,31 +229,74 @@ func (app *Master) cleanup() {
 
 func (app *Master) handleCommands(ctx context.Context) {
 	for {
+		// Anything on the priority queue goes first
+		select {
+		case cmd := <-app.priority_ch:
+			app.runCommand(ctx, cmd)
+			continue
+		default:
+		}
+
 		select {
 		case <-ctx.Done():
 			return
+		case cmd := <-app.priority_ch:
+			app.runCommand(ctx, cmd)
 		case cmd := <-app.command_ch:
-			switch cmd.kind {
-			case CMD_ARM:
-				app.ArmOrDisarm(ctx, true)
-			case CMD_DISARM:
-				app.ArmOrDisarm(ctx, false)
-			case CMD_SET_MODE:
-				app.SwitchMode(ctx, cmd.mode)
-			case CMD_MESSAGE_INTERVAL:
-				app.requestMessageAtInterval(ctx, cmd.msg_id, cmd.freq_hz)
-			}
-			if cmd.done != nil {
-				close(cmd.done)
+			// A normal command gives way as soon as a priority command arrives,
+			// then gets sent again
+			for app.runCommand(ctx, cmd) {
+				app.runPriorityCommands(ctx)
 			}
 		}
 	}
 }
 
+func (app *Master) runPriorityCommands(ctx context.Context) {
+	for {
+		select {
+		case cmd := <-app.priority_ch:
+			app.runCommand(ctx, cmd)
+		default:
+			return
+		}
+	}
+}
+
+// Returns true if the command was preempted and has to be run again
+func (app *Master) runCommand(ctx context.Context, cmd PixhawkCommand) (preempted bool) {
+	switch cmd.kind {
+	case CMD_ARM:
+		app.ArmOrDisarm(ctx, true)
+	case CMD_DISARM:
+		app.ArmOrDisarm(ctx, false)
+	case CMD_EMERGENCY_DISARM:
+		app.EmergencyDisarm(ctx)
+	case CMD_SET_MODE:
+		preempted = app.SwitchMode(ctx, cmd.mode)
+	case CMD_MESSAGE_INTERVAL:
+		preempted = app.requestMessageAtInterval(ctx, cmd.msg_id, cmd.freq_hz)
+	}
+	if !preempted && cmd.done != nil {
+		close(cmd.done)
+	}
+	return preempted
+}
+
 // Hand a command to handleCommands without blocking the caller
 func (app *Master) queueCommand(cmd PixhawkCommand) {
+	queue := app.command_ch
+	if cmd.kind.isPriority() {
+		queue = app.priority_ch
+	}
 	select {
-	case app.command_ch <- cmd:
+	case queue <- cmd:
+		if cmd.kind.isPriority() {
+			select {
+			case app.priority_signal <- struct{}{}:
+			default: // already signalled
+			}
+		}
 	default:
 		log.Error("[PIXHAWK] Command queue full, dropping command", "kind", cmd.kind)
 		if cmd.done != nil {
@@ -227,7 +307,10 @@ func (app *Master) queueCommand(cmd PixhawkCommand) {
 
 // Sends a COMMAND_LONG and waits for its COMMAND_ACK. Only one command is in
 // flight at a time, so any ack on ack_ch for this command is ours.
-func (app *Master) sendCommandLong(ctx context.Context, command common.MAV_CMD, params ...float32) (common.MAV_RESULT, error) {
+//
+// A preemptible command stops waiting and returns errPreempted as soon as a
+// priority command is queued.
+func (app *Master) sendCommandLong(ctx context.Context, preemptible bool, command common.MAV_CMD, params ...float32) (common.MAV_RESULT, error) {
 	app.mu.Lock()
 	target_system, target_component, have_target := app.target_system, app.target_component, app.have_target
 	app.mu.Unlock()
@@ -237,6 +320,20 @@ func (app *Master) sendCommandLong(ctx context.Context, command common.MAV_CMD, 
 
 	var p [7]float32
 	copy(p[:], params)
+
+	var preempt <-chan struct{} // nil channel: never fires
+	if preemptible {
+		// Clear a stale signal (its command may already have been handled),
+		// then check the queue itself
+		select {
+		case <-app.priority_signal:
+		default:
+		}
+		if len(app.priority_ch) > 0 {
+			return 0, errPreempted
+		}
+		preempt = app.priority_signal
+	}
 
 	// Throw away stale acks (eg. a late ack for a command that timed out)
 drain:
@@ -273,6 +370,8 @@ drain:
 				return ack.Result, nil
 			}
 			log.Debug("[PIXHAWK] Got ack for another command", "ack", ack)
+		case <-preempt:
+			return 0, errPreempted
 		case <-timeout:
 			return 0, errors.New("no ack")
 		case <-ctx.Done():
@@ -282,9 +381,26 @@ drain:
 }
 
 func (app *Master) ArmOrDisarm(ctx context.Context, arm bool) {
-	// Same as pymavlink's wait_heartbeat() before arming
-	if err := app.waitForHeartbeat(ctx, 3*time.Second); err != nil {
-		log.Warn("[PIXHAWK] No heartbeat before ARM / DISARM, sending anyway", "err", err)
+	if arm {
+		// Same as pymavlink's wait_heartbeat() before arming, but give up waiting
+		// as soon as something else lands on the priority queue
+		select {
+		case <-app.priority_signal: // stale, most likely from queueing this ARM
+		default:
+		}
+		if len(app.priority_ch) == 0 {
+			if err := app.waitForHeartbeat(ctx, 3*time.Second, app.priority_signal); err != nil {
+				log.Warn("[PIXHAWK] No heartbeat before ARM, sending anyway", "err", err)
+			}
+		}
+		// A DISARM or emergency kill may have come in while we waited
+		app.mu.Lock()
+		still_wanted := app.armed && !app.emergency_locked
+		app.mu.Unlock()
+		if !still_wanted {
+			log.Warn("[PIXHAWK] ARM cancelled, superseded by a DISARM / emergency kill")
+			return
+		}
 	}
 
 	var arm_v float32 = 0.0
@@ -297,7 +413,7 @@ func (app *Master) ArmOrDisarm(ctx context.Context, arm bool) {
 		what = "ARM"
 	}
 
-	ack_result, err := app.sendCommandLong(ctx, common.MAV_CMD_COMPONENT_ARM_DISARM, arm_v)
+	ack_result, err := app.sendCommandLong(ctx, false, common.MAV_CMD_COMPONENT_ARM_DISARM, arm_v)
 	switch {
 	case err != nil:
 		log.Warn("[PIXHAWK] "+what+" Command Sent, but", "err", err)
@@ -316,7 +432,29 @@ func (app *Master) ArmOrDisarm(ctx context.Context, arm bool) {
 	}
 }
 
-func (app *Master) SwitchMode(ctx context.Context, mode string) {
+// Force disarm straight away (no waiting for a heartbeat), retried until the
+// PixHawk acknowledges it
+func (app *Master) EmergencyDisarm(ctx context.Context) {
+	for attempt := 1; attempt <= 3; attempt++ {
+		ack_result, err := app.sendCommandLong(ctx, false, common.MAV_CMD_COMPONENT_ARM_DISARM, 0, FORCE_DISARM_MAGIC)
+		if err == nil && ack_result == common.MAV_RESULT_ACCEPTED {
+			log.Warn("[PIXHAWK] EMERGENCY DISARM accepted")
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Error("[PIXHAWK] EMERGENCY DISARM not confirmed, retrying", "attempt", attempt, "err", err)
+		} else {
+			log.Error("[PIXHAWK] EMERGENCY DISARM rejected, retrying", "attempt", attempt, "result", ack_result)
+		}
+	}
+	log.Error("[PIXHAWK] EMERGENCY DISARM never confirmed by the PixHawk!")
+}
+
+// Returns true if it was preempted by a priority command and has to be re-run
+func (app *Master) SwitchMode(ctx context.Context, mode string) bool {
 
 	var values_SUB_MODE = map[string]ardupilotmega.SUB_MODE{
 		"STABILIZE": ardupilotmega.SUB_MODE_STABILIZE,
@@ -336,14 +474,17 @@ func (app *Master) SwitchMode(ctx context.Context, mode string) {
 
 	if !ok {
 		log.Error("Invalid Mode, try STABILIZE, ACRO, ALT_HOLD, AUTO, GUIDED, CIRCLE, SURFACE, POSHOLD or MANUAL", "mode", mode)
-		return
+		return false
 	}
 
 	// MAV_CMD_DO_SET_MODE goes through the same code in ArduPilot as the
 	// SET_MODE message but, unlike SET_MODE, it gets acknowledged
-	ack_result, err := app.sendCommandLong(ctx, common.MAV_CMD_DO_SET_MODE,
+	ack_result, err := app.sendCommandLong(ctx, true, common.MAV_CMD_DO_SET_MODE,
 		float32(ardupilotmega.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED), float32(mode_val))
 
+	if errors.Is(err, errPreempted) {
+		return true
+	}
 	if err != nil {
 		log.Warn("[PIXHAWK] No ack for mode change, sending SET_MODE as well", "mode", mode, "err", err)
 		app.mu.Lock()
@@ -357,7 +498,7 @@ func (app *Master) SwitchMode(ctx context.Context, mode string) {
 		if err != nil {
 			log.Error("Failed to set pixhawk mode", "error", err)
 		}
-		return
+		return false
 	}
 
 	if ack_result == common.MAV_RESULT_ACCEPTED {
@@ -365,25 +506,34 @@ func (app *Master) SwitchMode(ctx context.Context, mode string) {
 	} else {
 		log.Error("[PIXHAWK] Mode change rejected", "mode", mode, "result", ack_result)
 	}
+	return false
 }
 
-func (app *Master) requestMessageAtInterval(ctx context.Context, msg_id uint32, freq_hz float64) {
+// Returns true if it was preempted by a priority command and has to be re-run
+func (app *Master) requestMessageAtInterval(ctx context.Context, msg_id uint32, freq_hz float64) bool {
 	log.Info("Request message at interval", "msgid", msg_id, "freq", freq_hz)
 
 	var ack_result common.MAV_RESULT
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		ack_result, err = app.sendCommandLong(ctx, common.MAV_CMD_SET_MESSAGE_INTERVAL, float32(msg_id), float32(1e6/freq_hz))
+		ack_result, err = app.sendCommandLong(ctx, true, common.MAV_CMD_SET_MESSAGE_INTERVAL, float32(msg_id), float32(1e6/freq_hz))
+		if errors.Is(err, errPreempted) {
+			return true
+		}
 		if err == nil || ctx.Err() != nil {
 			break
 		}
 	}
 
-	if err == nil && ack_result == common.MAV_RESULT_ACCEPTED {
+	switch {
+	case err != nil:
+		log.Error("[PIXHAWK] Failed request to modify interval of message", "id", msg_id, "err", err)
+	case ack_result != common.MAV_RESULT_ACCEPTED:
+		log.Error("[PIXHAWK] Failed request to modify interval of message", "id", msg_id, "result", ack_result)
+	default:
 		log.Info("[PIXHAWK] Succeded request to modify interval of message", "id", msg_id)
-	} else {
-		log.Error("[PIXHAWK] Failed request to modify interval of message", "id", msg_id, "result", ack_result, "err", err)
 	}
+	return false
 }
 
 func (app *Master) requestTelemetryStreams() {
@@ -467,19 +617,65 @@ func (app *Master) setArmed(arm bool) {
 	}
 }
 
+// Must be called with app.mu held
+func (app *Master) engageEmergency() {
+	app.emergency_locked = true
+	app.armed = false
+	app.channel_arr = [8]int{NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM, NEUTRAL_PWM}
+	// Sent even if we think we are disarmed, the vehicle may have been armed from elsewhere (eg. QGC)
+	app.queueCommand(PixhawkCommand{kind: CMD_EMERGENCY_DISARM})
+}
+
+// Engages the emergency lock and force disarms. Arming stays blocked until
+// /clear_emergency is called. Responds immediately, the disarm happens on the
+// priority queue.
+func (app *Master) onEmergencyKill(_ *rclgo.ServiceInfo, _ *std_srvs.Trigger_Request, sender std_srvs.TriggerServiceResponseSender) {
+	app.mu.Lock()
+	app.engageEmergency()
+	app.mu.Unlock()
+
+	resp := std_srvs.NewTrigger_Response()
+	resp.Success = true
+	resp.Message = "Emergency kill engaged, force disarming. Call /clear_emergency to allow arming again"
+	log.Warn("[*] " + resp.Message)
+	if err := sender.SendResponse(resp); err != nil {
+		log.Error("[ROS] Failed to respond to /emergency_kill", "err", err)
+	}
+}
+
+func (app *Master) onClearEmergency(_ *rclgo.ServiceInfo, _ *std_srvs.Trigger_Request, sender std_srvs.TriggerServiceResponseSender) {
+	app.mu.Lock()
+	was_locked := app.emergency_locked
+	app.emergency_locked = false
+	app.mu.Unlock()
+
+	resp := std_srvs.NewTrigger_Response()
+	resp.Success = true
+	if was_locked {
+		resp.Message = "Emergency lock cleared"
+	} else {
+		resp.Message = "No emergency was active"
+	}
+	log.Info("[*] " + resp.Message)
+	if err := sender.SendResponse(resp); err != nil {
+		log.Error("[ROS] Failed to respond to /clear_emergency", "err", err)
+	}
+}
+
+// Kept for mira2_control_master's killswitch node, which toggles on magnet removed / attached
 func (app *Master) onToggleEmergency(_ *rclgo.ServiceInfo, _ *std_srvs.Trigger_Request, sender std_srvs.TriggerServiceResponseSender) {
 	resp := std_srvs.NewTrigger_Response()
 	resp.Success = true
 
 	app.mu.Lock()
-	app.emergency_locked = !app.emergency_locked
-	if app.emergency_locked {
-		app.setArmed(false)
+	if !app.emergency_locked {
+		app.engageEmergency()
 		resp.Message = "Emergency lock engaged, disarming"
-		log.Warn(resp.Message)
+		log.Warn("[*] " + resp.Message)
 	} else {
+		app.emergency_locked = false
 		resp.Message = "Emergency lock cleared"
-		log.Info(resp.Message)
+		log.Info("[*] " + resp.Message)
 	}
 	app.mu.Unlock()
 
@@ -793,8 +989,9 @@ func (app *Master) listenForEvents(ctx context.Context) {
 	}
 }
 
-// Waits for the next heartbeat, like pymavlink's wait_heartbeat()
-func (app *Master) waitForHeartbeat(ctx context.Context, timeout time.Duration) error {
+// Waits for the next heartbeat, like pymavlink's wait_heartbeat(). Stops early
+// if interrupt fires (pass nil to wait for the full timeout).
+func (app *Master) waitForHeartbeat(ctx context.Context, timeout time.Duration, interrupt <-chan struct{}) error {
 	// Discard a heartbeat that arrived while nobody was waiting
 	select {
 	case <-app.heartbeat_ch:
@@ -803,6 +1000,8 @@ func (app *Master) waitForHeartbeat(ctx context.Context, timeout time.Duration) 
 	select {
 	case <-app.heartbeat_ch:
 		return nil
+	case <-interrupt:
+		return errors.New("interrupted by a priority command")
 	case <-time.After(timeout):
 		return errors.New("timed out waiting for heartbeat")
 	case <-ctx.Done():
@@ -875,7 +1074,7 @@ func main() {
 	}()
 
 	log.Info("[PIXHAWK] Waiting for heartbeat")
-	for app.waitForHeartbeat(sig_ctx, 5*time.Second) != nil {
+	for app.waitForHeartbeat(sig_ctx, 5*time.Second, nil) != nil {
 		if sig_ctx.Err() != nil {
 			cancel()
 			wg.Wait()
