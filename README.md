@@ -21,12 +21,18 @@ publishing each run in their own goroutine.
 | Kind | Name | Type | Notes |
 |---|---|---|---|
 | sub | `/master/commands` | `custom_msgs/Commands` | arm, mode and 8 PWM channels (all workspace publishers use this) |
-| sub | `/rov/commands` | `custom_msgs/Commands` | same handling, last message wins (as in `master.py`) |
+| sub | `/rov/commands` | `custom_msgs/Commands` | same handling, last message wins (from `master.py`; nothing publishes it today) |
 | pub | `/master/telemetry` | `custom_msgs/Telemetry` | same fields as `alt_master.py`, plus IMU fields from SCALED_IMU2 |
 | pub | `/master/imu_ned` | `sensor_msgs/Imu` | from SCALED_IMU2 (used by `flare_imu`) |
-| pub | `/master/depth` | `custom_msgs/Depth` | as in `master.py` |
-| pub | `/master/heading` | `custom_msgs/Heading` | as in `master.py` |
-| srv | `/toggle_emergency` | `std_srvs/Trigger` | engages/clears the emergency lock (used by `killswitch`) |
+| pub | `/master/depth` | `custom_msgs/Depth` | from `master.py` |
+| pub | `/master/heading` | `custom_msgs/Heading` | from `master.py` |
+| srv | `/emergency_kill` | `std_srvs/Trigger` | engages the emergency lock and force disarms; arming stays blocked until cleared |
+| srv | `/clear_emergency` | `std_srvs/Trigger` | releases the emergency lock |
+| srv | `/toggle_emergency` | `std_srvs/Trigger` | engages/clears the lock (used by `killswitch`) |
+
+ARM, DISARM and emergency disarm go through a priority queue. They are sent
+before any queued mode change or message-rate request, and a mode change or
+message-rate request that is waiting for its ack gives way immediately.
 
 Parameters (`--ros-args -p name:=value` or launch `<param>`):
 
